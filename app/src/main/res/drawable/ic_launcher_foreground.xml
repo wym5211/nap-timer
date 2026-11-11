@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 安全区 72dp：绳子从 20 下垂到 58，月亮落在 56..84 -->
+    <path
+        android:fillColor="#F7F5EB"
+        android:pathData="M51,20h6v38h-6z" />
+    <path
+        android:fillColor="#F7F5EB"
+        android:pathData="M54,56a14,14 0,1 0,0 28a14,14 0,1 0,0 -28" />
+</vector>

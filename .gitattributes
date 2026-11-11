@@ -1,0 +1,10 @@
+# 统一换行，避免 Windows 与 CI 之间反复出现整文件差异
+* text=auto eol=lf
+*.bat text eol=crlf
+
+# 二进制资源
+*.jar binary
+*.png binary
+*.jpg binary
+*.mp3 binary
+*.ogg binary

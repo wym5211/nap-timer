@@ -1,0 +1,16 @@
+.gradle/
+.kotlin/
+.idea/
+build/
+app/build/
+local.properties
+*.iml
+signing/
+*.apk
+*.idsig
+*.jks
+*.keystore
+
+# 临时截图（BMP 数据、扩展名是 .jpg，未在文档中引用）
+cap1.jpg
+cap2.jpg
