@@ -1,7 +1,9 @@
 package com.naptimer
 
-import android.app.NotificationManager
 import android.app.AlarmManager
+import android.app.NotificationManager
+import android.content.ComponentName
+import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
 import android.os.Looper
@@ -15,7 +17,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -29,12 +30,14 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class NapAlarmTest {
+    private fun alarms(context: Context) = shadowOf(context.getSystemService(AlarmManager::class.java))
+
     @Test
     fun silentNapHasAStopNotificationUntilStopped() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
         val notifications = context.getSystemService(NotificationManager::class.java)
 
-        assertNull(NapAlarm.start(context, 20, false, "calm"))
+        assertEquals(NapAlarm.StartOutcome.Started, NapAlarm.start(context, 20, false, "calm"))
         val state = NapStore(context).current()
         val notice = notifications.activeNotifications.singleOrNull()
         assertNotNull(notice)
@@ -43,6 +46,22 @@ class NapAlarmTest {
 
         NapAlarm.stop(context, state.id)
         assertEquals(0, notifications.activeNotifications.size)
+    }
+
+    @Test
+    fun startingANapSchedulesOneExactElapsedAlarmAndStoppingClearsIt() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+
+        assertEquals(NapAlarm.StartOutcome.Started, NapAlarm.start(context, 20, false, "calm"))
+        val state = NapStore(context).current()
+        val scheduled = alarms(context).scheduledAlarms.single()
+        assertEquals(AlarmManager.ELAPSED_REALTIME_WAKEUP, scheduled.type)
+        assertEquals(state.endElapsed, scheduled.triggerAtTime)
+        val remaining = state.endElapsed - SystemClock.elapsedRealtime()
+        assertTrue("remaining=$remaining", remaining in 1_199_000..1_200_000)
+
+        NapAlarm.stop(context, state.id)
+        assertEquals(0, alarms(context).scheduledAlarms.size)
     }
 
     @Test
@@ -57,7 +76,7 @@ class NapAlarmTest {
                 return super.stopService(service)
             }
         }
-        assertNull(NapAlarm.start(context, 20, false, "calm"))
+        assertEquals(NapAlarm.StartOutcome.Started, NapAlarm.start(context, 20, false, "calm"))
         val id = NapStore(context).current().id
         val stop = async(Dispatchers.IO) { NapAlarm.stop(blockingContext, id) }
         try {
@@ -66,7 +85,7 @@ class NapAlarmTest {
             assertFalse(withTimeoutOrNull(500) { start.await(); true } ?: false)
             release.countDown()
             stop.await()
-            assertNull(start.await())
+            assertEquals(NapAlarm.StartOutcome.Started, start.await())
             NapAlarm.stop(context, NapStore(context).current().id)
         } finally {
             release.countDown()
@@ -93,7 +112,7 @@ class NapAlarmTest {
         }
         assertNotNull(notice)
         assertTrue(notice!!.notification.extras.getString("android.text")!!.contains("暂停"))
-        assertEquals("active", store.current().status)
+        assertEquals(NapStatus.ACTIVE, store.current().status)
         NapAlarm.stop(context, "rebooted")
     }
 
@@ -106,10 +125,28 @@ class NapAlarmTest {
         context.sendBroadcast(Intent(context, NapBootReceiver::class.java).setAction(Intent.ACTION_BOOT_COMPLETED))
         shadowOf(Looper.getMainLooper()).idle()
         withTimeout(5_000) {
-            while (store.current().status == "pending") delay(10)
+            while (store.current().status == NapStatus.PENDING) delay(10)
         }
-        assertEquals("active", store.current().status)
+        assertEquals(NapStatus.ACTIVE, store.current().status)
         NapAlarm.stop(context, "pending-reboot")
+    }
+
+    @Test
+    fun installedUpdateRecoversTheNapLikeABoot() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        store.prepare("updated", 20, false, "calm", 1L, System.currentTimeMillis() + 60_000)
+        assertTrue(store.activate("updated"))
+        // 升级安装会清掉已排的闹钟。
+        assertEquals(0, alarms(context).scheduledAlarms.size)
+
+        context.sendBroadcast(Intent(context, NapBootReceiver::class.java).setAction(Intent.ACTION_MY_PACKAGE_REPLACED))
+        shadowOf(Looper.getMainLooper()).idle()
+        withTimeout(5_000) {
+            while (alarms(context).scheduledAlarms.isEmpty()) delay(10)
+        }
+        assertEquals(1, alarms(context).scheduledAlarms.size)
+        NapAlarm.stop(context, "updated")
     }
 
     @Test
@@ -118,10 +155,25 @@ class NapAlarmTest {
         val store = NapStore(context)
         store.prepare("pending-reopen", 20, false, "calm", 60_000L, System.currentTimeMillis() + 60_000)
 
-        assertNull(NapAlarm.recoverPending(context))
-        assertEquals("active", store.current().status)
-        assertEquals(1, shadowOf(context.getSystemService(AlarmManager::class.java)).scheduledAlarms.size)
+        assertEquals(NapAlarm.RecoverOutcome.Recovered, NapAlarm.recoverSession(context))
+        assertEquals(NapStatus.ACTIVE, store.current().status)
+        assertEquals(1, alarms(context).scheduledAlarms.size)
         NapAlarm.stop(context, "pending-reopen")
+    }
+
+    @Test
+    fun reopeningAppRearmsAnActiveSessionWhoseAlarmWasLost() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        val endElapsed = SystemClock.elapsedRealtime() + 120_000
+        store.prepare("active-lost", 20, false, "calm", endElapsed, System.currentTimeMillis() + 120_000)
+        assertTrue(store.activate("active-lost"))
+        assertEquals(0, alarms(context).scheduledAlarms.size)
+
+        assertEquals(NapAlarm.RecoverOutcome.Recovered, NapAlarm.recoverSession(context))
+        assertEquals(NapStatus.ACTIVE, store.current().status)
+        assertEquals(endElapsed, alarms(context).scheduledAlarms.single().triggerAtTime)
+        NapAlarm.stop(context, "active-lost")
     }
 
     @Test
@@ -131,10 +183,9 @@ class NapAlarmTest {
         val nowElapsed = SystemClock.elapsedRealtime()
         store.prepare("stale", 20, false, "calm", nowElapsed - 60_000, System.currentTimeMillis() - 60_000)
 
-        val message = NapAlarm.recoverPending(context)
-        assertNotNull(message)
-        assertEquals("idle", store.current().status)
-        assertEquals(0, shadowOf(context.getSystemService(AlarmManager::class.java)).scheduledAlarms.size)
+        assertEquals(NapAlarm.RecoverOutcome.Expired, NapAlarm.recoverSession(context))
+        assertEquals(NapStatus.IDLE, store.current().status)
+        assertEquals(0, alarms(context).scheduledAlarms.size)
     }
 
     @Test
@@ -144,12 +195,54 @@ class NapAlarmTest {
         // 单调时刻远大于 20 分钟时长，说明它来自上一次开机（elapsedRealtime 已重置）。
         store.prepare("stale-boot", 20, false, "calm", SystemClock.elapsedRealtime() + 86_400_000, System.currentTimeMillis() + 300_000)
 
-        assertNull(NapAlarm.recoverPending(context))
+        assertEquals(NapAlarm.RecoverOutcome.Recovered, NapAlarm.recoverSession(context))
         val state = store.current()
-        assertEquals("active", state.status)
+        assertEquals(NapStatus.ACTIVE, state.status)
         val remaining = state.endElapsed - SystemClock.elapsedRealtime()
         assertTrue("remaining=$remaining", remaining in 240_000..300_000)
         NapAlarm.stop(context, state.id)
+    }
+
+    @Test
+    fun firingTheAlarmStartsTheRingingService() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        store.prepare("alarm", 20, false, "calm", 1_000, 1_000)
+        assertTrue(store.activate("alarm"))
+
+        context.sendBroadcast(Intent(context, NapAlarmReceiver::class.java).putExtra("id", "alarm"))
+        val deadline = System.currentTimeMillis() + 5_000
+        var started: Intent? = null
+        while (System.currentTimeMillis() < deadline) {
+            shadowOf(Looper.getMainLooper()).idle()
+            started = shadowOf(context).nextStartedService
+            if (started != null && store.current().status == NapStatus.RINGING) break
+            delay(10)
+        }
+        assertEquals(NapStatus.RINGING, store.current().status)
+        assertNotNull(started)
+        assertEquals(NapAudioService::class.java.name, started!!.component?.className)
+        assertTrue("ringing extra", started.getBooleanExtra("ringing", false))
+        assertEquals("alarm", started.getStringExtra("id"))
+        NapAlarm.stop(context, "alarm")
+    }
+
+    @Test
+    fun ringFallsBackToTheSystemAlarmNoticeWhenTheAudioServiceCannotStart() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        store.prepare("unplayable", 20, false, "calm", 1_000, 1_000)
+        assertTrue(store.activate("unplayable"))
+        val brokenContext = object : ContextWrapper(context) {
+            override fun startForegroundService(service: Intent): ComponentName? =
+                throw IllegalStateException("foreground service blocked")
+        }
+
+        NapAlarm.ring(brokenContext, "unplayable")
+
+        val notifications = context.getSystemService(NotificationManager::class.java)
+        assertEquals("nap_alarm_fallback", notifications.activeNotifications.single().notification.channelId)
+        NapAlarm.stop(context, "unplayable")
     }
 
     @Test
@@ -162,7 +255,7 @@ class NapAlarmTest {
         context.sendBroadcast(Intent(context, NapBootReceiver::class.java).setAction(Intent.ACTION_BOOT_COMPLETED))
         shadowOf(Looper.getMainLooper()).idle()
         withTimeout(5_000) {
-            while (store.current().status != "idle") delay(10)
+            while (store.current().status != NapStatus.IDLE) delay(10)
         }
         val notifications = context.getSystemService(NotificationManager::class.java)
         val notice = withTimeout(5_000) {

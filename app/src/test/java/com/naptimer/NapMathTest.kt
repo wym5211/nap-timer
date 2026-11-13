@@ -21,10 +21,12 @@ class NapMathTest {
 
     @Test
     fun onlyActiveMatchingSessionCanRing() {
-        assertTrue(NapMath.shouldRing("active", "active", true))
-        assertFalse(NapMath.shouldRing("active", "old", true))
-        assertFalse(NapMath.shouldRing("active", "active", false))
-        assertFalse(NapMath.shouldRing("", "", true))
+        assertTrue(NapMath.shouldRing("active", "active", NapStatus.ACTIVE))
+        assertTrue(NapMath.shouldRing("pending", "pending", NapStatus.PENDING))
+        assertFalse(NapMath.shouldRing("active", "old", NapStatus.ACTIVE))
+        assertFalse(NapMath.shouldRing("active", "active", NapStatus.IDLE))
+        assertFalse(NapMath.shouldRing("ringing", "ringing", NapStatus.RINGING))
+        assertFalse(NapMath.shouldRing("", "", NapStatus.ACTIVE))
     }
 
     @Test
@@ -32,11 +34,5 @@ class NapMathTest {
         assertTrue(NapMath.isCurrentSession("current", "current"))
         assertFalse(NapMath.isCurrentSession("current", "old"))
         assertFalse(NapMath.isCurrentSession("", ""))
-    }
-
-    @Test
-    fun restartRecoveryNeverSchedulesAnExpiredSession() {
-        assertEquals(120_000L, NapMath.restartRemainingMillis(220_000L, 100_000L))
-        assertEquals(0L, NapMath.restartRemainingMillis(90_000L, 100_000L))
     }
 }

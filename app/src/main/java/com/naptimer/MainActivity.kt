@@ -2,6 +2,7 @@ package com.naptimer
 
 import android.Manifest
 import android.app.AlarmManager
+import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -122,6 +123,7 @@ private fun NapScreen(activity: MainActivity) {
     var initialized by rememberSaveable { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var showSoundSettings by remember { mutableStateOf(false) }
+    var showFullScreenPermission by remember { mutableStateOf(false) }
     var nowElapsed by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
     var nowWall by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -136,12 +138,20 @@ private fun NapScreen(activity: MainActivity) {
     val state = stored
     LaunchedEffect(Unit) {
         val interrupted = store.current()
-        if (interrupted.status == "pending") {
-            val message = NapAlarm.recoverPending(activity.applicationContext)
-            if (message != null) Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
-        } else if (interrupted.status == "active" && !NapAlarm.canSchedule(activity)) {
-            NapAlarm.stop(activity.applicationContext, interrupted.id)
-            Toast.makeText(activity, "精确闹钟权限已关闭，请重新设置午睡", Toast.LENGTH_LONG).show()
+        if (interrupted.status != NapStatus.PENDING && interrupted.status != NapStatus.ACTIVE) {
+            return@LaunchedEffect
+        }
+        val outcome = NapAlarm.recoverSession(activity.applicationContext)
+        val message = when (outcome) {
+            is NapAlarm.RecoverOutcome.Failed -> recoverFailureText(outcome.reason)
+            NapAlarm.RecoverOutcome.Expired -> "上次的午睡已到点，本次未能响铃"
+            NapAlarm.RecoverOutcome.Nothing, NapAlarm.RecoverOutcome.Recovered -> null
+        }
+        if (message != null) Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
+        if (outcome is NapAlarm.RecoverOutcome.Failed &&
+            outcome.reason == NapAlarm.Reason.EXACT_ALARM_DENIED
+        ) {
+            activity.openExactAlarmSettings()
         }
     }
     LaunchedEffect(state) {
@@ -160,7 +170,7 @@ private fun NapScreen(activity: MainActivity) {
         }
     }
 
-    fun beginNap() {
+    fun beginNap(skipFullScreenPermission: Boolean = false) {
         if (busy || state == null) return
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
@@ -178,19 +188,28 @@ private fun NapScreen(activity: MainActivity) {
         }
         if (!NapAlarm.canSchedule(activity)) {
             Toast.makeText(activity, "请允许设置精确闹钟，返回后再次点击开始", Toast.LENGTH_LONG).show()
-            if (Build.VERSION.SDK_INT >= 31) {
-                activity.startActivity(
-                    Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
-                        .setData(Uri.parse("package:${activity.packageName}")),
-                )
-            }
+            activity.openExactAlarmSettings()
+            return
+        }
+        if (!skipFullScreenPermission && Build.VERSION.SDK_INT >= 34 &&
+            !activity.getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
+        ) {
+            showFullScreenPermission = true
             return
         }
         busy = true
         scope.launch {
             try {
-                val message = NapAlarm.start(activity.applicationContext, minutes, sound, soundId)
-                if (message != null) Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
+                when (val outcome = NapAlarm.start(activity.applicationContext, minutes, sound, soundId)) {
+                    NapAlarm.StartOutcome.Started -> Unit
+                    is NapAlarm.StartOutcome.Failed -> {
+                        Toast.makeText(activity, startFailureText(outcome), Toast.LENGTH_LONG).show()
+                        // 权限在预检之后被关掉时，start 会以同一个原因失败：这里补上设置入口。
+                        if (outcome.reason == NapAlarm.Reason.EXACT_ALARM_DENIED) {
+                            activity.openExactAlarmSettings()
+                        }
+                    }
+                }
             } catch (_: Exception) {
                 Toast.makeText(activity, "设置失败，请重试", Toast.LENGTH_LONG).show()
             } finally {
@@ -225,14 +244,14 @@ private fun NapScreen(activity: MainActivity) {
         if (state == null) {
             Spacer(Modifier.height(100.dp))
             Text("正在准备午睡...", color = Ink)
-        } else if (state.status == "ringing") {
+        } else if (state.status == NapStatus.RINGING) {
             Spacer(Modifier.height(100.dp))
             Text("午睡结束", fontSize = 32.sp, color = Ink, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(14.dp))
             Text("休息好了，慢慢醒来", color = Green)
             Spacer(Modifier.height(50.dp))
             PrimaryButton("关闭闹钟", !busy) { stopNap(state.id) }
-        } else if (state.status == "active" || state.status == "pending") {
+        } else if (state.status == NapStatus.ACTIVE || state.status == NapStatus.PENDING) {
             Spacer(Modifier.height(45.dp))
             Text("安心休息", fontSize = 27.sp, color = Ink, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(12.dp))
@@ -296,6 +315,33 @@ private fun NapScreen(activity: MainActivity) {
                 soundId = id
             },
             onDismiss = { showSoundSettings = false },
+        )
+    }
+
+    if (showFullScreenPermission) {
+        AlertDialog(
+            onDismissRequest = { showFullScreenPermission = false },
+            title = { Text("允许全屏闹钟提醒") },
+            text = { Text("开启后，到点时才能尝试自动点亮屏幕并显示闹钟。不开启仍可午睡，但可能无法自动亮屏。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showFullScreenPermission = false
+                    try {
+                        activity.startActivity(
+                            Intent(Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT)
+                                .setData(Uri.parse("package:${activity.packageName}")),
+                        )
+                    } catch (_: RuntimeException) {
+                        Toast.makeText(activity, "无法打开设置，请在系统设置中开启全屏提醒", Toast.LENGTH_LONG).show()
+                    }
+                }) { Text("前往设置") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showFullScreenPermission = false
+                    beginNap(skipFullScreenPermission = true)
+                }) { Text("仍然开始") }
+            },
         )
     }
 }
@@ -427,6 +473,35 @@ private fun RopeSelector(minutes: Int, onChange: (Int) -> Unit) {
         ) {
             Box(Modifier.size(width = 20.dp, height = 30.dp).background(Rope, CircleShape))
         }
+    }
+}
+
+private fun startFailureText(outcome: NapAlarm.StartOutcome.Failed): String = when (outcome.reason) {
+    NapAlarm.Reason.EXACT_ALARM_DENIED -> "请允许设置精确闹钟，返回后再次点击开始"
+    NapAlarm.Reason.SESSION_RUNNING -> "已有进行中的午睡"
+    NapAlarm.Reason.STATE_CHANGED -> "午睡状态发生变化，请重试"
+    NapAlarm.Reason.SCHEDULE_FAILED -> "设置闹钟失败，请重试"
+    NapAlarm.Reason.AUDIO_FAILED ->
+        if (outcome.alarmStillSet) "闹钟已设置，但助眠音乐无法启动" else "助眠音乐无法启动"
+    NapAlarm.Reason.NOTIFICATION_FAILED ->
+        if (outcome.alarmStillSet) "闹钟已设置，但无法显示午睡通知" else "无法显示午睡通知"
+}
+
+private fun recoverFailureText(reason: NapAlarm.Reason): String = when (reason) {
+    NapAlarm.Reason.EXACT_ALARM_DENIED -> "精确闹钟权限已关闭，请重新设置午睡"
+    NapAlarm.Reason.SESSION_RUNNING -> "已有进行中的午睡"
+    NapAlarm.Reason.STATE_CHANGED -> "午睡状态发生变化，请重试"
+    NapAlarm.Reason.SCHEDULE_FAILED -> "无法恢复闹钟，请重新打开应用"
+    NapAlarm.Reason.AUDIO_FAILED -> "闹钟已恢复，但助眠音乐无法启动"
+    NapAlarm.Reason.NOTIFICATION_FAILED -> "闹钟已恢复，但无法显示午睡通知"
+}
+
+private fun MainActivity.openExactAlarmSettings() {
+    if (Build.VERSION.SDK_INT >= 31) {
+        startActivity(
+            Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
+                .setData(Uri.parse("package:$packageName")),
+        )
     }
 }
 

@@ -56,10 +56,11 @@ class NapAudioService : Service() {
         val ringing = intent.getBooleanExtra("ringing", false)
         isRinging = ringing
         val request = ++generation
-        startForeground(NOTIFICATION_ID, notification(this, id, ringing))
+        startForeground(if (ringing) ALARM_NOTIFICATION_ID else NOTIFICATION_ID, notification(this, id, ringing))
+        if (ringing) getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
         scope.launch {
             val state = NapStore(applicationContext).current()
-            val expected = if (ringing) "ringing" else "active"
+            val expected = if (ringing) NapStatus.RINGING else NapStatus.ACTIVE
             if (request != generation) return@launch
             if (state.id != id || state.status != expected || (!ringing && !state.sound)) {
                 stopSelf(startId)
@@ -92,25 +93,33 @@ class NapAudioService : Service() {
                     }
                     .build()
                 var waiting = false
-                while (audioManager.requestAudioFocus(focusRequest) != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                var granted = false
+                // 别的应用长期占着音频时不能让闹铃无限等下去：最多等 10 秒，之后照常播放。
+                for (attempt in 1..MAX_FOCUS_ATTEMPTS) {
+                    if (audioManager.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+                        granted = true
+                        break
+                    }
                     if (!waiting) {
                         waiting = true
                         getSystemService(NotificationManager::class.java).notify(
-                            NOTIFICATION_ID,
+                            ALARM_NOTIFICATION_ID,
                             notification(this@NapAudioService, id, ringing = true, text = "等待其他应用释放音频"),
                         )
                     }
-                    delay(2_000)
+                    if (attempt == MAX_FOCUS_ATTEMPTS) break
+                    delay(FOCUS_RETRY_MILLIS)
                     val current = NapStore(applicationContext).current()
-                    if (request != generation || current.id != id || current.status != "ringing") return@launch
+                    if (request != generation || current.id != id || current.status != NapStatus.RINGING) return@launch
                 }
                 if (waiting) {
+                    // 等到焦点，或者等待超时，都把通知文案恢复成正常响铃。
                     getSystemService(NotificationManager::class.java).notify(
-                        NOTIFICATION_ID,
+                        ALARM_NOTIFICATION_ID,
                         notification(this@NapAudioService, id, ringing = true),
                     )
                 }
-                alarmFocus = focusRequest
+                if (granted) alarmFocus = focusRequest
             }
             player.setMediaItem(MediaItem.fromUri(source))
             player.volume = 1f
@@ -132,11 +141,14 @@ class NapAudioService : Service() {
 
     companion object {
         private const val NOTIFICATION_ID = 1001
+        private const val ALARM_NOTIFICATION_ID = 1004
         private const val SESSION_NOTIFICATION_ID = 1003
         private const val PLAYBACK_CHANNEL = "nap_playback"
         private const val ALARM_CHANNEL = "nap_alarm"
         private const val FALLBACK_CHANNEL = "nap_alarm_fallback"
         private const val INFO_CHANNEL = "nap_info"
+        private const val MAX_FOCUS_ATTEMPTS = 5
+        private const val FOCUS_RETRY_MILLIS = 2_000L
 
         fun start(context: Context, id: String, ringing: Boolean) {
             val intent = Intent(context, NapAudioService::class.java)

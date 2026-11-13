@@ -13,9 +13,27 @@ import kotlinx.coroutines.flow.map
 
 private val Context.napDataStore by preferencesDataStore(name = "nap")
 
+/**
+ * 午睡会话的状态。
+ *
+ * 落盘时用小写名字，和 1.1 之前写入的字符串一模一样，升级安装不会把进行中的午睡变成空闲。
+ */
+enum class NapStatus {
+    IDLE,
+    PENDING,
+    ACTIVE,
+    RINGING;
+
+    val storedName: String get() = name.lowercase()
+
+    companion object {
+        fun fromStored(value: String?): NapStatus = entries.firstOrNull { it.storedName == value } ?: IDLE
+    }
+}
+
 data class NapState(
     val id: String = "",
-    val status: String = "idle",
+    val status: NapStatus = NapStatus.IDLE,
     val minutes: Int = 20,
     val sound: Boolean = true,
     val soundId: String = SleepSound.CALM.id,
@@ -37,7 +55,7 @@ class NapStore(private val context: Context) {
     val state: Flow<NapState> = context.napDataStore.data.map { prefs ->
         NapState(
             id = prefs[Keys.id] ?: "",
-            status = prefs[Keys.status] ?: "idle",
+            status = NapStatus.fromStored(prefs[Keys.status]),
             minutes = NapMath.clampMinutes(prefs[Keys.minutes] ?: 20),
             sound = prefs[Keys.sound] ?: true,
             soundId = SleepSound.fromId(prefs[Keys.soundId]).id,
@@ -51,7 +69,7 @@ class NapStore(private val context: Context) {
     suspend fun prepare(id: String, minutes: Int, sound: Boolean, soundId: String, endElapsed: Long, endWall: Long) {
         context.napDataStore.edit { prefs ->
             prefs[Keys.id] = id
-            prefs[Keys.status] = "pending"
+            prefs[Keys.status] = NapStatus.PENDING.storedName
             prefs[Keys.minutes] = NapMath.clampMinutes(minutes)
             prefs[Keys.sound] = sound
             prefs[Keys.soundId] = SleepSound.fromId(soundId).id
@@ -63,8 +81,8 @@ class NapStore(private val context: Context) {
     suspend fun activate(id: String): Boolean {
         var changed = false
         context.napDataStore.edit { prefs ->
-            if (prefs[Keys.id] == id && prefs[Keys.status] == "pending") {
-                prefs[Keys.status] = "active"
+            if (prefs[Keys.id] == id && NapStatus.fromStored(prefs[Keys.status]) == NapStatus.PENDING) {
+                prefs[Keys.status] = NapStatus.ACTIVE.storedName
                 changed = true
             }
         }
@@ -74,9 +92,9 @@ class NapStore(private val context: Context) {
     suspend fun claimAlarm(id: String): Boolean {
         var claimed = false
         context.napDataStore.edit { prefs ->
-            val status = prefs[Keys.status]
-            if (NapMath.shouldRing(prefs[Keys.id] ?: "", id, status == "active" || status == "pending")) {
-                prefs[Keys.status] = "ringing"
+            val status = NapStatus.fromStored(prefs[Keys.status])
+            if (NapMath.shouldRing(prefs[Keys.id] ?: "", id, status)) {
+                prefs[Keys.status] = NapStatus.RINGING.storedName
                 claimed = true
             }
         }
@@ -87,7 +105,7 @@ class NapStore(private val context: Context) {
         var changed = false
         context.napDataStore.edit { prefs ->
             if (NapMath.isCurrentSession(prefs[Keys.id] ?: "", id)) {
-                prefs[Keys.status] = "idle"
+                prefs[Keys.status] = NapStatus.IDLE.storedName
                 prefs[Keys.id] = ""
                 changed = true
             }
@@ -98,9 +116,10 @@ class NapStore(private val context: Context) {
     suspend fun recover(id: String, endElapsed: Long): Boolean {
         var changed = false
         context.napDataStore.edit { prefs ->
-            if (prefs[Keys.id] == id && (prefs[Keys.status] == "active" || prefs[Keys.status] == "pending")) {
+            val status = NapStatus.fromStored(prefs[Keys.status])
+            if (prefs[Keys.id] == id && (status == NapStatus.ACTIVE || status == NapStatus.PENDING)) {
                 prefs[Keys.endElapsed] = endElapsed
-                prefs[Keys.status] = "active"
+                prefs[Keys.status] = NapStatus.ACTIVE.storedName
                 changed = true
             }
         }

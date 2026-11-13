@@ -21,7 +21,18 @@ class NapStoreTest {
 
         assertFalse(store.claimAlarm("old-session"))
         assertTrue(store.claimAlarm("pending-session"))
-        assertEquals("ringing", store.current().status)
+        assertEquals(NapStatus.RINGING, store.current().status)
         assertFalse(store.claimAlarm("pending-session"))
+    }
+
+    @Test
+    fun statusStoredByThePreviousVersionStillLoads() {
+        // 1.1 之前写入的是小写名字，升级安装后不能把进行中的午睡读成空闲。
+        assertEquals(NapStatus.ACTIVE, NapStatus.fromStored("active"))
+        assertEquals(NapStatus.PENDING, NapStatus.fromStored("pending"))
+        assertEquals(NapStatus.RINGING, NapStatus.fromStored("ringing"))
+        assertEquals(NapStatus.IDLE, NapStatus.fromStored("idle"))
+        assertEquals(NapStatus.IDLE, NapStatus.fromStored(null))
+        assertEquals(NapStatus.IDLE, NapStatus.fromStored("something-else"))
     }
 }

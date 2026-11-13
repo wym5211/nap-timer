@@ -1,15 +1,17 @@
 package com.naptimer
 
-import android.content.Intent
 import android.app.NotificationManager
+import android.content.ComponentName
+import android.content.Intent
 import android.media.AudioManager
 import android.os.Looper
 import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -23,6 +25,37 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class NapAudioServiceTest {
+    @Test
+    fun ringingUsesANewFullScreenNotificationAfterSleepAudio() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        store.prepare("transition", 20, true, "calm", 1_000, 1_000)
+        assertTrue(store.activate("transition"))
+        val controller = Robolectric.buildService(NapAudioService::class.java).create()
+        val service = controller.get()
+        service.onStartCommand(
+            Intent(context, NapAudioService::class.java)
+                .putExtra("id", "transition")
+                .putExtra("ringing", false),
+            0,
+            1,
+        )
+        val sleepNotificationId = shadowOf(service).lastForegroundNotificationId
+
+        assertTrue(store.claimAlarm("transition"))
+        service.onStartCommand(
+            Intent(context, NapAudioService::class.java)
+                .putExtra("id", "transition")
+                .putExtra("ringing", true),
+            0,
+            2,
+        )
+        assertTrue(sleepNotificationId != shadowOf(service).lastForegroundNotificationId)
+        assertNotNull(shadowOf(service).lastForegroundNotification.fullScreenIntent)
+        controller.destroy()
+        Unit
+    }
+
     @Test
     fun sleepAudioUsesFullPlayerVolumeSoSystemVolumeControlsIt() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
@@ -51,11 +84,17 @@ class NapAudioServiceTest {
     }
 
     @Test
-    fun alarmFailureFallsBackToAnAudibleNotification() {
+    fun alarmFailureFallsBackToANotificationWithTheSystemAlarmSound() {
         val context = RuntimeEnvironment.getApplication()
         NapAudioService.notifyFailure(context, ringing = true)
-        val notification = context.getSystemService(NotificationManager::class.java).activeNotifications.single()
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val notification = manager.activeNotifications.single()
         assertEquals("nap_alarm_fallback", notification.notification.channelId)
+
+        // 渠道本身必须能出声：没声音、低优先级的兜底通知等于整次午睡静默失败。
+        val channel = manager.getNotificationChannel("nap_alarm_fallback")
+        assertEquals(NotificationManager.IMPORTANCE_HIGH, channel.importance)
+        assertNotNull(channel.sound)
     }
 
     @Test
@@ -92,6 +131,52 @@ class NapAudioServiceTest {
             notifications.activeNotifications.single()
         }
         assertEquals("休息好了，慢慢醒来", notice.notification.extras.getString("android.text"))
+        controller.destroy()
+        Unit
+    }
+
+    @Test
+    fun ringingStopsWaitingForAudioFocusAfterTheRetryBudget() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        store.prepare("blocked", 20, false, "calm", 1_000, 1_000)
+        assertTrue(store.activate("blocked"))
+        assertTrue(store.claimAlarm("blocked"))
+        val audio = shadowOf(context.getSystemService(AudioManager::class.java))
+        // 另一个应用一直占着音频：闹铃不能永远停在“等待其他应用释放音频”。
+        audio.setNextFocusRequestResponse(AudioManager.AUDIOFOCUS_REQUEST_FAILED)
+        val controller = Robolectric.buildService(NapAudioService::class.java).create()
+        val service = controller.get()
+        service.onStartCommand(Intent(context, NapAudioService::class.java)
+            .putExtra("id", "blocked")
+            .putExtra("ringing", true), 0, 1)
+
+        val notifications = context.getSystemService(NotificationManager::class.java)
+        withTimeout(5_000) {
+            while (audio.lastAudioFocusRequest == null) {
+                shadowOf(Looper.getMainLooper()).idle()
+                delay(10)
+            }
+        }
+        val deadline = System.currentTimeMillis() + 10_000
+        while (System.currentTimeMillis() < deadline &&
+            notifications.activeNotifications.none {
+                it.notification.extras.getString("android.text") == "休息好了，慢慢醒来"
+            }
+        ) {
+            shadowOf(Looper.getMainLooper()).idleFor(500, TimeUnit.MILLISECONDS)
+            delay(20)
+        }
+
+        assertTrue(
+            "ringing notice never came back: " + notifications.activeNotifications.map {
+                it.notification.extras.getString("android.text")
+            },
+            notifications.activeNotifications.any {
+                it.notification.extras.getString("android.text") == "休息好了，慢慢醒来"
+            },
+        )
+        assertFalse(shadowOf(service).isStoppedBySelf)
         controller.destroy()
         Unit
     }
