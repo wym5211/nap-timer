@@ -17,6 +17,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -37,7 +38,7 @@ class NapAlarmTest {
         val context = RuntimeEnvironment.getApplication()
         val notifications = context.getSystemService(NotificationManager::class.java)
 
-        assertEquals(NapAlarm.StartOutcome.Started, NapAlarm.start(context, 20, false, "calm"))
+        assertNull(NapAlarm.start(context, 20, false, "calm"))
         val state = NapStore(context).current()
         val notice = notifications.activeNotifications.singleOrNull()
         assertNotNull(notice)
@@ -52,7 +53,7 @@ class NapAlarmTest {
     fun startingANapSchedulesOneExactElapsedAlarmAndStoppingClearsIt() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
 
-        assertEquals(NapAlarm.StartOutcome.Started, NapAlarm.start(context, 20, false, "calm"))
+        assertNull(NapAlarm.start(context, 20, false, "calm"))
         val state = NapStore(context).current()
         val scheduled = alarms(context).scheduledAlarms.single()
         assertEquals(AlarmManager.ELAPSED_REALTIME_WAKEUP, scheduled.type)
@@ -76,7 +77,7 @@ class NapAlarmTest {
                 return super.stopService(service)
             }
         }
-        assertEquals(NapAlarm.StartOutcome.Started, NapAlarm.start(context, 20, false, "calm"))
+        assertNull(NapAlarm.start(context, 20, false, "calm"))
         val id = NapStore(context).current().id
         val stop = async(Dispatchers.IO) { NapAlarm.stop(blockingContext, id) }
         try {
@@ -85,7 +86,7 @@ class NapAlarmTest {
             assertFalse(withTimeoutOrNull(500) { start.await(); true } ?: false)
             release.countDown()
             stop.await()
-            assertEquals(NapAlarm.StartOutcome.Started, start.await())
+            assertNull(start.await())
             NapAlarm.stop(context, NapStore(context).current().id)
         } finally {
             release.countDown()
@@ -155,7 +156,7 @@ class NapAlarmTest {
         val store = NapStore(context)
         store.prepare("pending-reopen", 20, false, "calm", 60_000L, System.currentTimeMillis() + 60_000)
 
-        assertEquals(NapAlarm.RecoverOutcome.Recovered, NapAlarm.recoverSession(context))
+        assertNull(NapAlarm.recoverSession(context))
         assertEquals(NapStatus.ACTIVE, store.current().status)
         assertEquals(1, alarms(context).scheduledAlarms.size)
         NapAlarm.stop(context, "pending-reopen")
@@ -170,7 +171,7 @@ class NapAlarmTest {
         assertTrue(store.activate("active-lost"))
         assertEquals(0, alarms(context).scheduledAlarms.size)
 
-        assertEquals(NapAlarm.RecoverOutcome.Recovered, NapAlarm.recoverSession(context))
+        assertNull(NapAlarm.recoverSession(context))
         assertEquals(NapStatus.ACTIVE, store.current().status)
         assertEquals(endElapsed, alarms(context).scheduledAlarms.single().triggerAtTime)
         NapAlarm.stop(context, "active-lost")
@@ -183,7 +184,7 @@ class NapAlarmTest {
         val nowElapsed = SystemClock.elapsedRealtime()
         store.prepare("stale", 20, false, "calm", nowElapsed - 60_000, System.currentTimeMillis() - 60_000)
 
-        assertEquals(NapAlarm.RecoverOutcome.Expired, NapAlarm.recoverSession(context))
+        assertEquals("上次的午睡已到点，本次未能响铃", NapAlarm.recoverSession(context)?.message)
         assertEquals(NapStatus.IDLE, store.current().status)
         assertEquals(0, alarms(context).scheduledAlarms.size)
     }
@@ -195,7 +196,7 @@ class NapAlarmTest {
         // 单调时刻远大于 20 分钟时长，说明它来自上一次开机（elapsedRealtime 已重置）。
         store.prepare("stale-boot", 20, false, "calm", SystemClock.elapsedRealtime() + 86_400_000, System.currentTimeMillis() + 300_000)
 
-        assertEquals(NapAlarm.RecoverOutcome.Recovered, NapAlarm.recoverSession(context))
+        assertNull(NapAlarm.recoverSession(context))
         val state = store.current()
         assertEquals(NapStatus.ACTIVE, state.status)
         val remaining = state.endElapsed - SystemClock.elapsedRealtime()
@@ -265,5 +266,20 @@ class NapAlarmTest {
         assertEquals("午睡已结束", notice.notification.extras.getString("android.title"))
         assertEquals("nap_info", notice.notification.channelId)
         assertTrue(notice.notification.extras.getString("android.text")!!.contains("未能响铃"))
+    }
+
+    @Test
+    fun ringingWakesTheScreenAndStoppingReleasesTheWakeLock() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        NapScreenWake.release()
+        val store = NapStore(context)
+        store.prepare("wake", 20, false, "calm", 1_000, 1_000)
+        assertTrue(store.activate("wake"))
+
+        NapAlarm.ring(context, "wake")
+        assertTrue("到点必须点亮屏幕，不能等用户按电源键", NapScreenWake.isHeld())
+
+        NapAlarm.stop(context, "wake")
+        assertFalse(NapScreenWake.isHeld())
     }
 }

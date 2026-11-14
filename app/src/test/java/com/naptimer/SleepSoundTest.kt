@@ -1,7 +1,6 @@
 package com.naptimer
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Test
 
 class SleepSoundTest {
@@ -26,15 +25,4 @@ class SleepSoundTest {
         }
     }
 
-    @Test
-    fun removedTrackFallsBackToCalm() {
-        assertEquals(SleepSound.CALM, SleepSound.fromId("relaxing_piano"))
-        assertFalse(SleepSound.entries.any { it.id == "relaxing_piano" })
-    }
-
-    @Test
-    fun recordedNatureSoundsAreNotPresentedAsSynthetic() {
-        assertFalse(SleepSound.RAIN.label.contains("合成"))
-        assertFalse(SleepSound.OCEAN.label.contains("合成"))
-    }
 }

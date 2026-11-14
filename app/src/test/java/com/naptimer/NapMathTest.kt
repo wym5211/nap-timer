@@ -1,8 +1,6 @@
 package com.naptimer
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
-import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class NapMathTest {
@@ -19,20 +17,4 @@ class NapMathTest {
         assertEquals(0L, NapMath.remainingMillis(50_000L, 51_000L))
     }
 
-    @Test
-    fun onlyActiveMatchingSessionCanRing() {
-        assertTrue(NapMath.shouldRing("active", "active", NapStatus.ACTIVE))
-        assertTrue(NapMath.shouldRing("pending", "pending", NapStatus.PENDING))
-        assertFalse(NapMath.shouldRing("active", "old", NapStatus.ACTIVE))
-        assertFalse(NapMath.shouldRing("active", "active", NapStatus.IDLE))
-        assertFalse(NapMath.shouldRing("ringing", "ringing", NapStatus.RINGING))
-        assertFalse(NapMath.shouldRing("", "", NapStatus.ACTIVE))
-    }
-
-    @Test
-    fun staleStopActionCannotStopTheCurrentSession() {
-        assertTrue(NapMath.isCurrentSession("current", "current"))
-        assertFalse(NapMath.isCurrentSession("current", "old"))
-        assertFalse(NapMath.isCurrentSession("", ""))
-    }
 }

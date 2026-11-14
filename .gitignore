@@ -11,6 +11,9 @@ signing/
 *.jks
 *.keystore
 
+# WorkBuddy 项目数据与记忆，不进版本库
+.workbuddy/
+
 # 临时截图（BMP 数据、扩展名是 .jpg，未在文档中引用）
 cap1.jpg
 cap2.jpg

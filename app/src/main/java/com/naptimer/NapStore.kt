@@ -92,8 +92,11 @@ class NapStore(private val context: Context) {
     suspend fun claimAlarm(id: String): Boolean {
         var claimed = false
         context.napDataStore.edit { prefs ->
+            val currentId = prefs[Keys.id] ?: ""
             val status = NapStatus.fromStored(prefs[Keys.status])
-            if (NapMath.shouldRing(prefs[Keys.id] ?: "", id, status)) {
+            if (currentId.isNotEmpty() && currentId == id &&
+                (status == NapStatus.ACTIVE || status == NapStatus.PENDING)
+            ) {
                 prefs[Keys.status] = NapStatus.RINGING.storedName
                 claimed = true
             }
@@ -104,7 +107,8 @@ class NapStore(private val context: Context) {
     suspend fun finish(id: String): Boolean {
         var changed = false
         context.napDataStore.edit { prefs ->
-            if (NapMath.isCurrentSession(prefs[Keys.id] ?: "", id)) {
+            val currentId = prefs[Keys.id] ?: ""
+            if (currentId.isNotEmpty() && currentId == id) {
                 prefs[Keys.status] = NapStatus.IDLE.storedName
                 prefs[Keys.id] = ""
                 changed = true

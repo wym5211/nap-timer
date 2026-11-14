@@ -1,8 +1,6 @@
 package com.naptimer
 
 import android.Manifest
-import android.app.AlarmManager
-import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -90,9 +88,9 @@ import java.util.Date
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 
-private val Background = Color(0xFFF7F5EB)
-private val Ink = Color(0xFF25382D)
-private val Green = Color(0xFF43634A)
+internal val Background = Color(0xFFF7F5EB)
+internal val Ink = Color(0xFF25382D)
+internal val Green = Color(0xFF43634A)
 private val Rope = Color(0xFF927D5D)
 
 class MainActivity : ComponentActivity() {
@@ -141,18 +139,9 @@ private fun NapScreen(activity: MainActivity) {
         if (interrupted.status != NapStatus.PENDING && interrupted.status != NapStatus.ACTIVE) {
             return@LaunchedEffect
         }
-        val outcome = NapAlarm.recoverSession(activity.applicationContext)
-        val message = when (outcome) {
-            is NapAlarm.RecoverOutcome.Failed -> recoverFailureText(outcome.reason)
-            NapAlarm.RecoverOutcome.Expired -> "上次的午睡已到点，本次未能响铃"
-            NapAlarm.RecoverOutcome.Nothing, NapAlarm.RecoverOutcome.Recovered -> null
-        }
-        if (message != null) Toast.makeText(activity, message, Toast.LENGTH_LONG).show()
-        if (outcome is NapAlarm.RecoverOutcome.Failed &&
-            outcome.reason == NapAlarm.Reason.EXACT_ALARM_DENIED
-        ) {
-            activity.openExactAlarmSettings()
-        }
+        val problem = NapAlarm.recoverSession(activity.applicationContext) ?: return@LaunchedEffect
+        Toast.makeText(activity, problem.message, Toast.LENGTH_LONG).show()
+        if (problem.openExactAlarmSettings) activity.openExactAlarmSettings()
     }
     LaunchedEffect(state) {
         if (state != null && !initialized) {
@@ -191,24 +180,17 @@ private fun NapScreen(activity: MainActivity) {
             activity.openExactAlarmSettings()
             return
         }
-        if (!skipFullScreenPermission && Build.VERSION.SDK_INT >= 34 &&
-            !activity.getSystemService(NotificationManager::class.java).canUseFullScreenIntent()
-        ) {
+        if (!skipFullScreenPermission && !NapAudioService.canUseFullScreenIntent(activity)) {
             showFullScreenPermission = true
             return
         }
         busy = true
         scope.launch {
             try {
-                when (val outcome = NapAlarm.start(activity.applicationContext, minutes, sound, soundId)) {
-                    NapAlarm.StartOutcome.Started -> Unit
-                    is NapAlarm.StartOutcome.Failed -> {
-                        Toast.makeText(activity, startFailureText(outcome), Toast.LENGTH_LONG).show()
-                        // 权限在预检之后被关掉时，start 会以同一个原因失败：这里补上设置入口。
-                        if (outcome.reason == NapAlarm.Reason.EXACT_ALARM_DENIED) {
-                            activity.openExactAlarmSettings()
-                        }
-                    }
+                // 权限在预检之后被关掉时，start 会返回失败：这里补上设置入口。
+                NapAlarm.start(activity.applicationContext, minutes, sound, soundId)?.let { problem ->
+                    Toast.makeText(activity, problem.message, Toast.LENGTH_LONG).show()
+                    if (problem.openExactAlarmSettings) activity.openExactAlarmSettings()
                 }
             } catch (_: Exception) {
                 Toast.makeText(activity, "设置失败，请重试", Toast.LENGTH_LONG).show()
@@ -370,7 +352,7 @@ private fun SoundSettingsDialog(
     LaunchedEffect(soundId) {
         player.stop()
         previewing = false
-        val resourceId = SleepSound.fromId(soundId).resourceId()
+        val resourceId = SleepSound.fromId(soundId).resId
         player.setMediaItem(MediaItem.fromUri("android.resource://${activity.packageName}/$resourceId"))
     }
     AlertDialog(
@@ -421,7 +403,7 @@ private fun SoundSettingsDialog(
 }
 
 @Composable
-private fun PrimaryButton(text: String, enabled: Boolean, onClick: () -> Unit) {
+internal fun PrimaryButton(text: String, enabled: Boolean, onClick: () -> Unit) {
     Button(
         onClick = onClick,
         enabled = enabled,
@@ -474,26 +456,6 @@ private fun RopeSelector(minutes: Int, onChange: (Int) -> Unit) {
             Box(Modifier.size(width = 20.dp, height = 30.dp).background(Rope, CircleShape))
         }
     }
-}
-
-private fun startFailureText(outcome: NapAlarm.StartOutcome.Failed): String = when (outcome.reason) {
-    NapAlarm.Reason.EXACT_ALARM_DENIED -> "请允许设置精确闹钟，返回后再次点击开始"
-    NapAlarm.Reason.SESSION_RUNNING -> "已有进行中的午睡"
-    NapAlarm.Reason.STATE_CHANGED -> "午睡状态发生变化，请重试"
-    NapAlarm.Reason.SCHEDULE_FAILED -> "设置闹钟失败，请重试"
-    NapAlarm.Reason.AUDIO_FAILED ->
-        if (outcome.alarmStillSet) "闹钟已设置，但助眠音乐无法启动" else "助眠音乐无法启动"
-    NapAlarm.Reason.NOTIFICATION_FAILED ->
-        if (outcome.alarmStillSet) "闹钟已设置，但无法显示午睡通知" else "无法显示午睡通知"
-}
-
-private fun recoverFailureText(reason: NapAlarm.Reason): String = when (reason) {
-    NapAlarm.Reason.EXACT_ALARM_DENIED -> "精确闹钟权限已关闭，请重新设置午睡"
-    NapAlarm.Reason.SESSION_RUNNING -> "已有进行中的午睡"
-    NapAlarm.Reason.STATE_CHANGED -> "午睡状态发生变化，请重试"
-    NapAlarm.Reason.SCHEDULE_FAILED -> "无法恢复闹钟，请重新打开应用"
-    NapAlarm.Reason.AUDIO_FAILED -> "闹钟已恢复，但助眠音乐无法启动"
-    NapAlarm.Reason.NOTIFICATION_FAILED -> "闹钟已恢复，但无法显示午睡通知"
 }
 
 private fun MainActivity.openExactAlarmSettings() {

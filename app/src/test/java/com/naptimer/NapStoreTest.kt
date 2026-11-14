@@ -35,4 +35,15 @@ class NapStoreTest {
         assertEquals(NapStatus.IDLE, NapStatus.fromStored(null))
         assertEquals(NapStatus.IDLE, NapStatus.fromStored("something-else"))
     }
+
+    @Test
+    fun staleStopActionCannotEndTheCurrentSession() = runBlocking {
+        val store = NapStore(RuntimeEnvironment.getApplication())
+        store.prepare("current", 20, false, "calm", 1_000L, 1_000L)
+
+        assertFalse(store.finish("old"))
+        assertEquals("current", store.current().id)
+        assertTrue(store.finish("current"))
+        assertEquals(NapStatus.IDLE, store.current().status)
+    }
 }
