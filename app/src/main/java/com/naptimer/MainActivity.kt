@@ -122,8 +122,6 @@ private fun NapScreen(activity: MainActivity) {
     var busy by remember { mutableStateOf(false) }
     var showSoundSettings by remember { mutableStateOf(false) }
     var showFullScreenPermission by remember { mutableStateOf(false) }
-    var nowElapsed by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-    var nowWall by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { granted ->
@@ -149,13 +147,6 @@ private fun NapScreen(activity: MainActivity) {
             sound = state.sound
             soundId = state.soundId
             initialized = true
-        }
-    }
-    LaunchedEffect(Unit) {
-        while (isActive) {
-            nowElapsed = SystemClock.elapsedRealtime()
-            nowWall = System.currentTimeMillis()
-            delay(1_000)
         }
     }
 
@@ -239,14 +230,7 @@ private fun NapScreen(activity: MainActivity) {
             Spacer(Modifier.height(12.dp))
             Text("正在为你守着时间", color = Green)
             Spacer(Modifier.height(80.dp))
-            val remaining = NapMath.remainingMillis(state.endElapsed, nowElapsed)
-            val seconds = ceil(remaining / 1000.0).toLong()
-            Text(
-                "%02d:%02d".format(seconds / 60, seconds % 60),
-                fontSize = 64.sp,
-                color = Ink,
-            )
-            Text("预计 ${timeText(nowWall + remaining)} 唤醒", color = Green)
+            CountdownAndWakeTime(state.endElapsed)
             Spacer(Modifier.height(80.dp))
             Text(
                 if (state.sound) "助眠声音 · ${SleepSound.fromId(state.soundId).label}" else "助眠声音 · 静音",
@@ -267,7 +251,7 @@ private fun NapScreen(activity: MainActivity) {
                 Text("$minutes", color = Ink, fontSize = 64.sp, lineHeight = 68.sp)
                 Text("分钟", color = Ink, fontSize = 16.sp, modifier = Modifier.padding(start = 8.dp, bottom = 10.dp))
             }
-            Text("预计 ${timeText(nowWall + minutes * 60_000L)} 唤醒", color = Green, fontSize = 13.sp)
+            IdleWakeTime(minutes)
             Spacer(Modifier.height(12.dp))
             RopeSelector(minutes) { minutes = it }
             Text("上下拉动绳结，调整午睡时长", color = Green, fontSize = 12.sp)
@@ -402,6 +386,46 @@ private fun SoundSettingsDialog(
     )
 }
 
+/**
+ * 倒计时与预计唤醒时刻。计时状态只在这个叶子作用域内读取，1Hz tick 不会作废
+ * NapScreen 整个 Column 内容 lambda（拉绳 Canvas、按钮都不再被每秒重组）。
+ */
+@Composable
+private fun CountdownAndWakeTime(endElapsed: Long) {
+    var nowElapsed by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+    var nowWall by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            nowElapsed = SystemClock.elapsedRealtime()
+            nowWall = System.currentTimeMillis()
+            delay(1_000)
+        }
+    }
+    val remaining = NapMath.remainingMillis(endElapsed, nowElapsed)
+    val seconds = ceil(remaining / 1000.0).toLong()
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(
+            "%02d:%02d".format(seconds / 60, seconds % 60),
+            fontSize = 64.sp,
+            color = Ink,
+        )
+        Text("预计 ${timeText(nowWall + remaining)} 唤醒", color = Green)
+    }
+}
+
+/** 首页只显示到分钟，没必要每秒刷新；改时长时参数变化会立即重组。 */
+@Composable
+private fun IdleWakeTime(minutes: Int) {
+    var nowWall by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            nowWall = System.currentTimeMillis()
+            delay(60_000)
+        }
+    }
+    Text("预计 ${timeText(nowWall + minutes * 60_000L)} 唤醒", color = Green, fontSize = 13.sp)
+}
+
 @Composable
 internal fun PrimaryButton(text: String, enabled: Boolean, onClick: () -> Unit) {
     Button(
@@ -467,5 +491,7 @@ private fun MainActivity.openExactAlarmSettings() {
     }
 }
 
-private fun timeText(millis: Long): String =
-    DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(millis))
+// Compose 只在主线程调用，复用实例避免每次 tick 都新建 DateFormat。
+private val wakeTimeFormat = DateFormat.getTimeInstance(DateFormat.SHORT)
+
+private fun timeText(millis: Long): String = wakeTimeFormat.format(Date(millis))

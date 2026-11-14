@@ -11,7 +11,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [28])
+@Config(sdk = [28, 34, 35])
 class NapStoreTest {
     @Test
     fun scheduledPendingSessionCanRingAfterInterruptedSetup() = runBlocking {

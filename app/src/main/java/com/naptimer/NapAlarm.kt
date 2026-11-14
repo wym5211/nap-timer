@@ -16,10 +16,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.io.IOException
 import java.util.UUID
 
 object NapAlarm {
     private val sessionMutex = Mutex()
+
+    /** 开机广播的来源：升级安装不会重置 elapsedRealtime，和重启用的恢复时基不同。 */
+    enum class BootReason { REBOOT, PACKAGE_UPDATED }
 
     /** 失败时返回可直接展示的提示；[openExactAlarmSettings] 为真时界面要引导用户去开权限。 */
     data class Problem(val message: String, val openExactAlarmSettings: Boolean = false)
@@ -78,10 +82,13 @@ object NapAlarm {
         val id = UUID.randomUUID().toString()
         val endElapsed = SystemClock.elapsedRealtime() + duration
         return try {
-            schedule(context, id, endElapsed)
+            // 先落 PENDING 再排系统闹钟：闹钟独立于本进程存活，进程若在两行之间被杀，
+            // recoverSession 还能凭 PENDING 补排；反过来只会留下一个没人认领的闹钟。
             store.prepare(id, minutes, sound, soundId, endElapsed, System.currentTimeMillis() + duration)
+            schedule(context, id, endElapsed)
             if (!store.activate(id)) {
                 cancel(context, id)
+                store.finish(id)
                 Problem("午睡状态发生变化，请重试")
             } else {
                 resumeSession(
@@ -97,6 +104,12 @@ object NapAlarm {
             cancel(context, id)
             store.finish(id)
             Problem("设置闹钟失败，请重试")
+        } catch (_: IOException) {
+            // DataStore 写盘失败抛的是 IOException，不属于 RuntimeException；
+            // 此时闹钟可能已经排上，必须同样复位，不能让界面停留在假进行中。
+            cancel(context, id)
+            store.finish(id)
+            Problem("设置闹钟失败，请重试")
         }
     }
 
@@ -105,13 +118,16 @@ object NapAlarm {
     }
 
     private suspend fun stopLocked(context: Context, id: String) {
-        if (NapStore(context).finish(id)) {
-            NapScreenWake.release()
-            cancel(context, id)
-            NapAudioService.cancelSessionNotification(context, id)
-            NapAudioService.cancelAlarmNotifications(context)
-            context.stopService(Intent(context, NapAudioService::class.java))
-        }
+        if (NapStore(context).finish(id)) cleanupSession(context, id)
+    }
+
+    /** 会话结束后的统一收尾：用户主动停止与恢复失败都走这里，避免漏停音乐或漏清通知。 */
+    private fun cleanupSession(context: Context, id: String) {
+        NapScreenWake.release()
+        cancel(context, id)
+        NapAudioService.cancelSessionNotification(context, id)
+        NapAudioService.cancelAlarmNotifications(context)
+        context.stopService(Intent(context, NapAudioService::class.java))
     }
 
     suspend fun ring(context: Context, id: String) = withContext(NonCancellable) {
@@ -151,27 +167,16 @@ object NapAlarm {
                 cancel(context, state.id)
                 return@withLock Problem("上次的午睡已到点，本次未能响铃")
             }
-            if (!canSchedule(context)) {
-                // 没有精确闹钟权限时这次午睡不可能响，留着界面只会继续倒数；结束它并把权限交给用户重开。
-                stopLocked(context, state.id)
-                return@withLock Problem(NO_EXACT_ALARM_RECOVER, openExactAlarmSettings = true)
-            }
-            try {
-                schedule(context, state.id, target)
-                // 用 recover 而不是 activate：跨开机恢复时到点时刻已按墙上时钟重算，必须一起写回。
-                if (!store.recover(state.id, target)) {
-                    cancel(context, state.id)
-                    return@withLock Problem("午睡状态发生变化，请重试")
-                }
-                resumeSession(
-                    context, state.id, state.sound,
-                    restoreAudio = true, silentText = "静音午睡中", prefix = "闹钟已恢复，但",
-                )
-            } catch (_: SecurityException) {
-                Problem(NO_EXACT_ALARM_RECOVER, openExactAlarmSettings = true)
-            } catch (_: RuntimeException) {
-                Problem("无法恢复闹钟，请重新打开应用")
-            }
+            restoreAlarm(
+                context = context,
+                store = store,
+                state = state,
+                targetElapsed = target,
+                failedText = "无法恢复闹钟，请重新打开应用",
+                restoreAudio = true,
+                silentText = "静音午睡中",
+                prefix = "闹钟已恢复，但",
+            )
         }
     }
 
@@ -192,6 +197,50 @@ object NapAlarm {
                 if (remaining > 0) nowElapsed + remaining else null
             }
             else -> null
+        }
+    }
+
+    /**
+     * 恢复进行中会话的唯一编排：权限检查 -> 排钟 -> 写回 -> 恢复音频/通知。
+     *
+     * 重开应用、开机、升级安装三个入口都走这里，只提供各自的到点时刻与音频模式。
+     * 任何一步失败都统一结束会话、取消闹钟并留下提示，避免界面继续倒数一个没排上的闹钟。
+     */
+    private suspend fun restoreAlarm(
+        context: Context,
+        store: NapStore,
+        state: NapState,
+        targetElapsed: Long,
+        failedText: String,
+        restoreAudio: Boolean,
+        silentText: String,
+        prefix: String,
+    ): Problem? {
+        if (!canSchedule(context)) {
+            finishAndNotify(context, store, state.id, NO_EXACT_ALARM_RECOVER)
+            return Problem(NO_EXACT_ALARM_RECOVER, openExactAlarmSettings = true)
+        }
+        return try {
+            schedule(context, state.id, targetElapsed)
+            // endWall 必须和 endElapsed 一起写回：二次恢复还会读它，留着旧值会再次污染时基。
+            val endWall = System.currentTimeMillis() +
+                NapMath.remainingMillis(targetElapsed, SystemClock.elapsedRealtime())
+            if (!store.recover(state.id, targetElapsed, endWall)) {
+                finishAndNotify(context, store, state.id, failedText)
+                Problem("午睡状态发生变化，请重试")
+            } else {
+                // 闹钟已经排上，通知/音频失败按设计只提示、不回滚会话。
+                resumeSession(context, state.id, state.sound, restoreAudio, silentText, prefix)
+            }
+        } catch (_: SecurityException) {
+            finishAndNotify(context, store, state.id, failedText)
+            Problem(NO_EXACT_ALARM_RECOVER, openExactAlarmSettings = true)
+        } catch (_: RuntimeException) {
+            finishAndNotify(context, store, state.id, failedText)
+            Problem(failedText)
+        } catch (_: IOException) {
+            finishAndNotify(context, store, state.id, failedText)
+            Problem(failedText)
         }
     }
 
@@ -222,7 +271,7 @@ object NapAlarm {
 
     private suspend fun finishAndNotify(context: Context, store: NapStore, id: String, text: String) {
         if (store.finish(id)) {
-            cancel(context, id)
+            cleanupSession(context, id)
             try {
                 NapAudioService.notifyMissed(context, text)
             } catch (_: RuntimeException) {
@@ -231,46 +280,51 @@ object NapAlarm {
         }
     }
 
-    suspend fun recoverAfterBoot(context: Context) = withContext(NonCancellable) {
+    /**
+     * 开机/升级恢复到点时刻。
+     *
+     * 重启会重置 elapsedRealtime，只能按墙上时钟估算剩余；升级安装不会重置单调时钟，
+     * endElapsed 此刻仍然精确有效，用 endWall 覆写反而会让用户提前或延后被叫醒。
+     */
+    private fun bootTarget(state: NapState, reason: BootReason): Long? {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        if (reason == BootReason.PACKAGE_UPDATED) {
+            // endElapsed 明显超出时长说明它来自上一次开机，此时才退回墙上时钟。
+            return pendingTarget(state, nowElapsed)
+        }
+        val remaining = NapMath.remainingMillis(state.endWall, System.currentTimeMillis())
+            .coerceAtMost(state.minutes * 60_000L)
+        return if (remaining > 0) nowElapsed + remaining else null
+    }
+
+    suspend fun recoverAfterBoot(context: Context, reason: BootReason): Unit = withContext(NonCancellable) {
         sessionMutex.withLock {
             val store = NapStore(context)
             val state = store.current()
             when (state.status) {
                 NapStatus.ACTIVE, NapStatus.PENDING -> {
-                    val remaining = NapMath.remainingMillis(state.endWall, System.currentTimeMillis())
-                        .coerceAtMost(state.minutes * 60_000L)
-                    when {
-                        remaining <= 0 ->
-                            finishAndNotify(context, store, state.id, "设备重启期间已到点，本次未能响铃")
-                        !canSchedule(context) ->
-                            finishAndNotify(context, store, state.id, "重启后未能恢复闹钟，请重新设置并允许精确闹钟")
-                        else -> {
-                            val endElapsed = SystemClock.elapsedRealtime() + remaining
-                            try {
-                                schedule(context, state.id, endElapsed)
-                                if (store.recover(state.id, endElapsed)) {
-                                    resumeSession(
-                                        context,
-                                        state.id,
-                                        state.sound,
-                                        restoreAudio = false,
-                                        silentText = if (state.sound) "设备重启后助眠音乐已暂停，闹钟仍在运行" else "静音午睡中",
-                                        prefix = "闹钟已恢复，但",
-                                    )
-                                    // 通知失败不影响闹钟，闹钟已经排上了。
-                                } else {
-                                    cancel(context, state.id)
-                                }
-                            } catch (_: RuntimeException) {
-                                finishAndNotify(context, store, state.id, "重启后未能恢复闹钟，请重新设置")
-                            }
-                        }
+                    val target = bootTarget(state, reason)
+                    if (target == null) {
+                        finishAndNotify(context, store, state.id, "设备重启期间已到点，本次未能响铃")
+                    } else {
+                        restoreAlarm(
+                            context = context,
+                            store = store,
+                            state = state,
+                            targetElapsed = target,
+                            failedText = "重启后未能恢复闹钟，请重新设置",
+                            restoreAudio = false,
+                            silentText = if (state.sound) "设备重启后助眠音乐已暂停，闹钟仍在运行" else "静音午睡中",
+                            prefix = "闹钟已恢复，但",
+                        )
                     }
                 }
-                // 响铃中的会话没有可恢复的上下文，重启后直接结束。
-                NapStatus.RINGING -> store.finish(state.id)
+                // 响铃中的会话没有可恢复的上下文，按正常停止流程完整清理，
+                // 否则通知、前台服务与唤醒锁会因为会话 id 已被清空而关不掉。
+                NapStatus.RINGING -> stopLocked(context, state.id)
                 NapStatus.IDLE -> Unit
             }
+            Unit
         }
     }
 }
@@ -290,14 +344,23 @@ class NapAlarmReceiver : BroadcastReceiver() {
 }
 
 /**
- * 开机和升级安装都会清掉已排的闹钟，两种回调走同一套恢复流程。
+ * 开机和升级安装都会清掉已排的闹钟，但两者的恢复时基不同，见 [NapAlarm.BootReason]。
+ *
+ * exported=true 是接收隐式开机广播所必需的；而显式 Intent 按 component 投递会绕过
+ * intent-filter 的 action 匹配，所以这里必须自己再校验一次 action。只放行系统的
+ * protected-broadcast，第三方应用无法伪造这两个 action 来驱动会话状态机。
  */
 class NapBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        val reason = when (intent.action) {
+            Intent.ACTION_BOOT_COMPLETED -> NapAlarm.BootReason.REBOOT
+            Intent.ACTION_MY_PACKAGE_REPLACED -> NapAlarm.BootReason.PACKAGE_UPDATED
+            else -> return
+        }
         val pending = goAsync()
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
-                NapAlarm.recoverAfterBoot(context)
+                NapAlarm.recoverAfterBoot(context, reason)
             } finally {
                 pending.finish()
             }

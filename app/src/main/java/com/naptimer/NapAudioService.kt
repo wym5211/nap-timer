@@ -27,12 +27,22 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
-class NapAudioService : Service() {
+open class NapAudioService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private lateinit var player: ExoPlayer
     private var generation = 0
     private var isRinging = false
     private var sessionId = ""
+    // 走兜底通知时锁归兜底路径所有，onDestroy 不能把它顺手放掉。
+    private var fallbackActive = false
+
+    /**
+     * 单独留一个可覆写的入口，便于单测模拟 Android 12+ 在 Service.startForeground()
+     * 抛异常的路径（该方法在 framework 里是 final，无法直接 override）。
+     */
+    protected open fun beginForeground(id: Int, notification: Notification) {
+        startForeground(id, notification)
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -40,6 +50,7 @@ class NapAudioService : Service() {
         player = ExoPlayer.Builder(this).build()
         player.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
+                fallbackActive = true
                 notifyFailure(this@NapAudioService, sessionId, isRinging)
                 stopSelf()
             }
@@ -60,17 +71,20 @@ class NapAudioService : Service() {
         if (ringing) cancelAlarmNotifications(this)
         val manager = getSystemService(NotificationManager::class.java)
         try {
-            startForeground(
+            beginForeground(
                 if (ringing) ALARM_NOTIFICATION_ID else NOTIFICATION_ID,
                 serviceNotification(this, id, ringing),
             )
         } catch (_: RuntimeException) {
             // Android 12+ 拒绝后台启动前台服务时，异常在 Service.startForeground() 抛出，
             // 而不是在 Context.startForegroundService()。所以兜底必须放在这里。
+            // notifyFailure 会重新点亮屏幕，随后 stopSelf 触发的 onDestroy 绝不能再释放这把锁。
+            fallbackActive = true
             notifyFailure(this, id, ringing)
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        fallbackActive = false
         if (ringing) {
             manager.cancel(NOTIFICATION_ID)
             // full-screen intent 必须由 NotificationManager.notify() 单独投递：挂在
@@ -109,7 +123,9 @@ class NapAudioService : Service() {
         scope.cancel()
         player.release()
         // 服务被系统杀掉时声音也没了，别让屏幕继续亮着；正常关闭时 NapAlarm.stop 已先释放。
-        if (isRinging) NapScreenWake.release()
+        // 但前台服务/播放失败走兜底通知时，锁是 notifyFailure() 刚申请的，屏幕刚亮就释放
+        // 会让兜底自我抵消；这把锁由 NapAlarm.stop() 或锁自身超时来收尾。
+        if (isRinging && !fallbackActive) NapScreenWake.release()
         super.onDestroy()
     }
 

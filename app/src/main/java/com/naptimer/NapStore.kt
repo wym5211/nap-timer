@@ -117,12 +117,14 @@ class NapStore(private val context: Context) {
         return changed
     }
 
-    suspend fun recover(id: String, endElapsed: Long): Boolean {
+    /** 恢复时到点时刻按单调时钟重算，墙上时钟目标必须一起写回，否则二次恢复会读到旧值。 */
+    suspend fun recover(id: String, endElapsed: Long, endWall: Long): Boolean {
         var changed = false
         context.napDataStore.edit { prefs ->
             val status = NapStatus.fromStored(prefs[Keys.status])
             if (prefs[Keys.id] == id && (status == NapStatus.ACTIVE || status == NapStatus.PENDING)) {
                 prefs[Keys.endElapsed] = endElapsed
+                prefs[Keys.endWall] = endWall
                 prefs[Keys.status] = NapStatus.ACTIVE.storedName
                 changed = true
             }

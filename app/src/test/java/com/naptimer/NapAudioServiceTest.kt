@@ -2,6 +2,7 @@ package com.naptimer
 
 import android.app.Notification
 import android.app.NotificationManager
+import android.content.Context
 import android.content.Intent
 import android.os.Looper
 import androidx.media3.exoplayer.ExoPlayer
@@ -23,8 +24,17 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [28])
+@Config(sdk = [28, 34, 35])
 class NapAudioServiceTest {
+    /** SDK 34+ 未授权时系统不给 FSI，通知必须降级成 heads-up 而不是继续挂全屏 intent。 */
+    private fun assertFullScreenIntentMatchesPermission(context: Context, notification: Notification) {
+        if (NapAudioService.canUseFullScreenIntent(context)) {
+            assertNotNull(notification.fullScreenIntent)
+        } else {
+            assertNull("API 34+ 未授权全屏时必须降级为 heads-up", notification.fullScreenIntent)
+        }
+    }
+
     @Test
     fun ringingUsesANewFullScreenNotificationAfterSleepAudio() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
@@ -57,7 +67,7 @@ class NapAudioServiceTest {
         val alert = manager.activeNotifications.first {
             it.id == NapAudioService.ALARM_ALERT_ID
         }.notification
-        assertNotNull(alert.fullScreenIntent)
+        assertFullScreenIntentMatchesPermission(context, alert)
         assertEquals(Notification.VISIBILITY_PUBLIC, alert.visibility)
         controller.destroy()
         Unit
@@ -110,7 +120,7 @@ class NapAudioServiceTest {
         val actions = requireNotNull(notification.actions)
         assertTrue(actions.isNotEmpty())
         assertFalse("通知动作必须有真实图标", actions[0].icon == 0)
-        assertNotNull(notification.fullScreenIntent)
+        assertFullScreenIntentMatchesPermission(context, notification)
     }
 
     @Test
@@ -141,16 +151,18 @@ class NapAudioServiceTest {
         assertTrue(actions.isNotEmpty())
         assertFalse("通知动作必须有真实图标", actions[0].icon == 0)
 
-        val fullScreen = requireNotNull(notice.fullScreenIntent)
-        assertEquals(
-            NapRingingActivity::class.java.name,
-            shadowOf(fullScreen).savedIntent.component?.className,
-        )
-        // contentIntent 与 fullScreenIntent 必须是两个独立的 PendingIntent。
-        assertNotEquals(
-            shadowOf(notice.contentIntent).savedIntent.data,
-            shadowOf(fullScreen).savedIntent.data,
-        )
+        assertFullScreenIntentMatchesPermission(context, notice)
+        notice.fullScreenIntent?.let { fullScreen ->
+            assertEquals(
+                NapRingingActivity::class.java.name,
+                shadowOf(fullScreen).savedIntent.component?.className,
+            )
+            // contentIntent 与 fullScreenIntent 必须是两个独立的 PendingIntent。
+            assertNotEquals(
+                shadowOf(notice.contentIntent).savedIntent.data,
+                shadowOf(fullScreen).savedIntent.data,
+            )
+        }
         controller.destroy()
         Unit
     }
@@ -175,5 +187,37 @@ class NapAudioServiceTest {
         assertTrue("兜底路径必须点亮屏幕", NapScreenWake.isHeld())
         NapScreenWake.release()
         assertFalse(NapScreenWake.isHeld())
+    }
+
+    /**
+     * 完整走一遍 Android 12+ 的失败链：startForeground 抛异常 -> notifyFailure 取锁
+     * -> stopSelf -> onDestroy。onDestroy 不能把兜底刚申请的锁放掉，否则屏幕刚亮即灭。
+     */
+    @Test
+    fun foregroundStartFailureKeepsTheFallbackWakeLockAfterTeardown() {
+        val context = RuntimeEnvironment.getApplication()
+        NapScreenWake.release()
+        val controller = Robolectric.buildService(FailingForegroundService::class.java).create()
+        val service = controller.get()
+        service.onStartCommand(
+            Intent(context, NapAudioService::class.java)
+                .putExtra("id", "fgs-fail")
+                .putExtra("ringing", true),
+            0,
+            1,
+        )
+        assertTrue("前台服务启动失败时兜底通知必须点亮屏幕", NapScreenWake.isHeld())
+        controller.destroy()
+        assertTrue("onDestroy 不能释放兜底路径的唤醒锁", NapScreenWake.isHeld())
+
+        NapScreenWake.release()
+        assertFalse(NapScreenWake.isHeld())
+    }
+}
+
+/** 模拟 Android 12+ 在 Service.startForeground() 拒绝后台启动前台服务。 */
+class FailingForegroundService : NapAudioService() {
+    override fun beginForeground(id: Int, notification: Notification) {
+        throw RuntimeException("fgs blocked")
     }
 }

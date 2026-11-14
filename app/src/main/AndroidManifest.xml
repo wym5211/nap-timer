@@ -38,6 +38,7 @@
             android:foregroundServiceType="mediaPlayback" />
         <receiver android:name=".NapAlarmReceiver" android:exported="false" />
         <receiver android:name=".NapStopReceiver" android:exported="false" />
+        <!-- 开机广播是隐式广播，必须保持 exported；NapBootReceiver 在 onReceive 内做 action 白名单校验。 -->
         <receiver
             android:name=".NapBootReceiver"
             android:enabled="true"

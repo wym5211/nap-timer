@@ -19,19 +19,28 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowAlarmManager
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [28])
+// 28 覆盖 minSdk 附近行为，34/35 覆盖 targetSdk 上的精确闹钟与全屏权限分支。
+@Config(sdk = [28, 34, 35])
 class NapAlarmTest {
     private fun alarms(context: Context) = shadowOf(context.getSystemService(AlarmManager::class.java))
+
+    @Before
+    fun grantExactAlarmPermission() {
+        // SDK 31+ 的 ShadowAlarmManager 默认拒绝精确闹钟；正常调度路径需要先授权限。
+        ShadowAlarmManager.setCanScheduleExactAlarms(true)
+    }
 
     @Test
     fun silentNapHasAStopNotificationUntilStopped() = runBlocking {
@@ -133,10 +142,13 @@ class NapAlarmTest {
     }
 
     @Test
-    fun installedUpdateRecoversTheNapLikeABoot() = runBlocking {
+    fun installedUpdateKeepsTheStillValidElapsedDeadline() = runBlocking {
         val context = RuntimeEnvironment.getApplication()
         val store = NapStore(context)
-        store.prepare("updated", 20, false, "calm", 1L, System.currentTimeMillis() + 60_000)
+        val endElapsed = SystemClock.elapsedRealtime() + 120_000
+        // 升级不会重置 elapsedRealtime；即便墙上时钟被前拨，单调到点时刻仍精确有效。
+        val staleEndWall = System.currentTimeMillis() - 600_000 + 120_000
+        store.prepare("updated", 20, false, "calm", endElapsed, staleEndWall)
         assertTrue(store.activate("updated"))
         // 升级安装会清掉已排的闹钟。
         assertEquals(0, alarms(context).scheduledAlarms.size)
@@ -146,8 +158,41 @@ class NapAlarmTest {
         withTimeout(5_000) {
             while (alarms(context).scheduledAlarms.isEmpty()) delay(10)
         }
-        assertEquals(1, alarms(context).scheduledAlarms.size)
+        assertEquals("升级不能用墙上时钟覆写仍有效的单调到点时刻", endElapsed, alarms(context).scheduledAlarms.single().triggerAtTime)
+        // schedule 一返回闹钟就可见，recover 的写回还在同一协程里，等它落盘再断言。
+        withTimeout(5_000) {
+            while (store.current().endWall == staleEndWall) {
+                shadowOf(Looper.getMainLooper()).idle()
+                delay(10)
+            }
+        }
+        val recovered = store.current()
+        assertEquals(NapStatus.ACTIVE, recovered.status)
+        assertEquals(endElapsed, recovered.endElapsed)
+        assertTrue("endWall 必须随恢复一起写回，否则二次恢复会读到旧值", recovered.endWall > staleEndWall)
         NapAlarm.stop(context, "updated")
+    }
+
+    @Test
+    fun foreignExplicitBootBroadcastCannotDriveRecovery() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        val endElapsed = SystemClock.elapsedRealtime() + 120_000
+        store.prepare("foreign", 20, false, "calm", endElapsed, System.currentTimeMillis() + 120_000)
+        assertTrue(store.activate("foreign"))
+
+        // 显式 Intent 按 component 投递会绕过 intent-filter；不带 action 或伪造 action
+        // 的第三方广播必须被接收器直接丢弃（正向对照见 rebootedNapWarns... 等用例）。
+        context.sendBroadcast(Intent(context, NapBootReceiver::class.java))
+        context.sendBroadcast(Intent(context, NapBootReceiver::class.java).setAction("com.naptimer.FAKE_BOOT"))
+        shadowOf(Looper.getMainLooper()).idle()
+        delay(100)
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(NapStatus.ACTIVE, store.current().status)
+        assertEquals(endElapsed, store.current().endElapsed)
+        assertEquals(0, alarms(context).scheduledAlarms.size)
+        NapAlarm.stop(context, "foreign")
     }
 
     @Test
