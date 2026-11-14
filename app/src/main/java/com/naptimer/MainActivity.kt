@@ -17,6 +17,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -32,6 +33,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -330,47 +332,67 @@ private fun SoundSettingsDialog(
         }
     }
     var previewing by remember { mutableStateOf(false) }
+    // 每次发起试听都换一个 token，让下面的 5 秒倒计时取消旧的、重新计时。
+    var previewToken by remember { mutableIntStateOf(0) }
     DisposableEffect(player) {
         onDispose { player.release() }
     }
-    LaunchedEffect(soundId) {
+
+    /** 从头播放指定音频，并启动 5 秒自动停止。 */
+    fun startPreview(option: SleepSound) {
         player.stop()
-        previewing = false
-        val resourceId = SleepSound.fromId(soundId).resId
-        player.setMediaItem(MediaItem.fromUri("android.resource://${activity.packageName}/$resourceId"))
+        player.setMediaItem(MediaItem.fromUri("android.resource://${activity.packageName}/${option.resId}"))
+        player.prepare()
+        player.play()
+        previewing = true
+        previewToken++
     }
+
+    fun stopPreview() {
+        player.pause()
+        previewing = false
+        previewToken++
+    }
+
+    // 试听最多 5 秒；换曲目、手动停止或关闭弹窗时，key 变化会取消上一次 delay。
+    LaunchedEffect(previewToken, previewing) {
+        if (!previewing) return@LaunchedEffect
+        delay(PREVIEW_DURATION_MS)
+        player.pause()
+        previewing = false
+    }
+
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("助眠声音") },
         text = {
-            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
-                Column(Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+            Column(Modifier.fillMaxWidth().heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                Column(Modifier.fillMaxWidth().heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
                     SleepSound.entries.forEach { option ->
-                        TextButton(onClick = {
-                            player.pause()
-                            previewing = false
-                            onSoundChange(true, option.id)
-                        }) {
-                            Text(if (sound && soundId == option.id) "✓ ${option.label}" else option.label)
-                        }
+                        SoundOptionRow(
+                            label = option.label,
+                            selected = sound && soundId == option.id,
+                            onClick = {
+                                onSoundChange(true, option.id)
+                                startPreview(option)
+                            },
+                        )
                     }
-                    TextButton(onClick = {
-                        onSoundChange(false, soundId)
-                        player.pause()
-                        previewing = false
-                    }) { Text(if (!sound) "✓ 静音" else "静音") }
+                    SoundOptionRow(
+                        label = "静音",
+                        selected = !sound,
+                        onClick = {
+                            onSoundChange(false, soundId)
+                            stopPreview()
+                        },
+                    )
                 }
                 if (sound) {
+                    Text("点击任意一行即可选中并试听 5 秒", color = Green, fontSize = 12.sp)
                     Text("使用手机音量键调节音量", color = Green, fontSize = 12.sp)
                     TextButton(onClick = {
-                        if (previewing) {
-                            player.pause()
-                        } else {
-                            player.prepare()
-                            player.play()
-                        }
-                        previewing = !previewing
-                    }) { Text(if (previewing) "停止预听" else "预听") }
+                        if (previewing) stopPreview() else startPreview(SleepSound.fromId(soundId))
+                    }) { Text(if (previewing) "停止试听" else "重听 5 秒") }
                     SleepSound.fromId(soundId).attribution?.let { attribution ->
                         Text(
                             attribution,
@@ -385,6 +407,33 @@ private fun SoundSettingsDialog(
         confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
     )
 }
+
+/** 整行都是点击区域，避免只有文字宽度内可点。 */
+@Composable
+private fun SoundOptionRow(label: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .background(
+                color = if (selected) Green.copy(alpha = 0.10f) else Color.Transparent,
+                shape = RoundedCornerShape(8.dp),
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            if (selected) "✓" else "",
+            modifier = Modifier.width(22.dp),
+            color = Green,
+            fontSize = 14.sp,
+        )
+        Text(label, color = if (selected) Green else Ink, fontSize = 14.sp)
+    }
+}
+
+private const val PREVIEW_DURATION_MS = 5_000L
 
 /**
  * 倒计时与预计唤醒时刻。计时状态只在这个叶子作用域内读取，1Hz tick 不会作废
