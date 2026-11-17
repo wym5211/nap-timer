@@ -105,8 +105,8 @@ open class NapAudioService : Service() {
                 .setUsage(if (ringing) C.USAGE_ALARM else C.USAGE_MEDIA)
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
                 .build()
-            // ExoPlayer 按 usage 自动申请/释放音频焦点；闹铃不等待其他应用让路。
-            player.setAudioAttributes(attributes, true)
+            // ExoPlayer 不支持为 USAGE_ALARM 自动管理音频焦点。
+            player.setAudioAttributes(attributes, !ringing)
             if (ringing) player.stop()
             player.setMediaItem(MediaItem.fromUri(Uri.parse("android.resource://$packageName/$soundResource")))
             player.volume = 1f

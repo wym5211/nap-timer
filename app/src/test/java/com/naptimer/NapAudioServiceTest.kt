@@ -5,6 +5,7 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.os.Looper
+import androidx.media3.common.C
 import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -97,6 +98,40 @@ class NapAudioServiceTest {
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(1f, player.volume, 0f)
         controller.destroy()
+        Unit
+    }
+
+    @Test
+    fun ringingStartsPlaybackUsingAlarmAudio() = runBlocking {
+        val context = RuntimeEnvironment.getApplication()
+        val store = NapStore(context)
+        store.prepare("ringing-audio", 20, false, "calm", 1_000, 1_000)
+        assertTrue(store.activate("ringing-audio"))
+        assertTrue(store.claimAlarm("ringing-audio"))
+        val controller = Robolectric.buildService(NapAudioService::class.java).create()
+        val service = controller.get()
+        try {
+            service.onStartCommand(
+                Intent(context, NapAudioService::class.java)
+                    .putExtra("id", "ringing-audio")
+                    .putExtra("ringing", true),
+                0,
+                1,
+            )
+            val field = NapAudioService::class.java.getDeclaredField("player")
+            field.isAccessible = true
+            val player = field.get(service) as ExoPlayer
+            withTimeout(5_000) {
+                while (!player.playWhenReady) {
+                    shadowOf(Looper.getMainLooper()).idle()
+                    delay(10)
+                }
+            }
+            assertEquals(C.USAGE_ALARM, player.audioAttributes.usage)
+            assertEquals(1, player.mediaItemCount)
+        } finally {
+            controller.destroy()
+        }
         Unit
     }
 
